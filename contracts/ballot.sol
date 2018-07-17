@@ -1,144 +1,89 @@
-pragma solidity ^0.4.0;
+pragma solidity ^0.4.16;
 
-/// @title Voting with delegation.
-contract Ballot {
-    // This declares a new complex type which will
-    // be used for variables later.
-    // It will represent a single voter.
-    struct Voter {
-        uint weight; // weight is accumulated by delegation
-        bool voted;  // if true, that person already voted
-        address delegate; // person delegated to
-        uint vote;   // index of the voted proposal
+interface tokenRecipient { function receiveApproval(address _from, uint256 _value, address _token, bytes _extraData) public; }  // token的 接受者 这里声明接口, 将会在我们的ABI里
+
+contract TokenERC20 {
+/*********Token的属性说明************/
+    string public name = 4FunCoin;
+    string public symbol = 4FC;
+    uint8 public decimals = 18;  // 18 是建议的默认值
+    uint256 public totalSupply; // 发行量
+
+    // 建立映射 地址对应了 uint' 便是他的余额
+    mapping (address => uint256) public balanceOf;   
+    // 地址对应余额
+    mapping (address => mapping (address => uint256)) public allowance;
+
+     // 事件，用来通知客户端Token交易发生
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+     // 事件，用来通知客户端代币被消耗(这里就不是转移, 是token用了就没了)
+    event Burn(address indexed from, uint256 value);
+
+    // 这里是构造函数, 实例创建时候执行
+    function TokenERC20(uint256 initialSupply, string tokenName, string tokenSymbol) public {
+        totalSupply = initialSupply * 10 ** uint256(decimals);  // 这里确定了总发行量
+
+        balanceOf[msg.sender] = totalSupply;    // 这里就比较重要, 这里相当于实现了, 把token 全部给合约的Creator
+
+        name = tokenName;
+        symbol = tokenSymbol;
     }
 
-    // This is a type for a single proposal.
-    struct Proposal
-    {
-        bytes32 name;   // short name (up to 32 bytes)
-        uint voteCount; // number of accumulated votes
+    // token的发送函数
+    function _transfer(address _from, address _to, uint _value) internal {
+
+        require(_to != 0x0);    // 不是零地址
+        require(balanceOf[_from] >= _value);        // 有足够的余额来发送
+        require(balanceOf[_to] + _value > balanceOf[_to]);  // 这里也有意思, 不能发送负数的值(hhhh)
+
+        uint previousBalances = balanceOf[_from] + balanceOf[_to];  // 这个是为了校验, 避免过程出错, 总量不变对吧?
+        balanceOf[_from] -= _value; //发钱 不多说
+        balanceOf[_to] += _value;
+        Transfer(_from, _to, _value);   // 这里触发了转账的事件 , 见上event
+        assert(balanceOf[_from] + balanceOf[_to] == previousBalances);  // 判断总额是否一致, 避免过程出错
     }
 
-    address public chairperson;
+    function transfer(address _to, uint256 _value) public {
+        _transfer(msg.sender, _to, _value); // 这里已经储存了 合约创建者的信息, 这个函数是只能被合约创建者使用
+    }
 
-    // This declares a state variable that
-    // stores a \`Voter\` struct for each possible address.
-    mapping(address => Voter) public voters;
+    function transferFrom(address _from, address _to, uint256 _value) public returns (bool success) {
+        require(_value <= allowance[_from][msg.sender]);     // 这句很重要, 地址对应的合约地址(也就是token余额)
+        allowance[_from][msg.sender] -= _value;
+        _transfer(_from, _to, _value);
+        return true;
+    }
 
-    // A dynamically-sized array of \`Proposal\` structs.
-    Proposal[] public proposals;
+    function approve(address _spender, uint256 _value) public
+        returns (bool success) {
+        allowance[msg.sender][_spender] = _value;   // 这里是可花费总量
+        return true;
+    }
 
-    /// Create a new ballot to choose one of \`proposalNames\`.
-    function Ballot(bytes32[] proposalNames) {
-        chairperson = msg.sender;
-        voters[chairperson].weight = 1;
-
-        // For each of the provided proposal names,
-        // create a new proposal object and add it
-        // to the end of the array.
-        for (uint i = 0; i < proposalNames.length; i++) {
-            // \`Proposal({...})\` creates a temporary
-            // Proposal object and \`proposals.push(...)\`
-            // appends it to the end of \`proposals\`.
-            proposals.push(Proposal({
-                name: proposalNames[i],
-                voteCount: 0
-            }));
+    function approveAndCall(address _spender, uint256 _value, bytes _extraData) public returns (bool success) {
+        tokenRecipient spender = tokenRecipient(_spender);
+        if (approve(_spender, _value)) {
+            spender.receiveApproval(msg.sender, _value, this, _extraData);
+            return true;
         }
     }
-
-    // Give \`voter\` the right to vote on this ballot.
-    // May only be called by \`chairperson\`.
-    function giveRightToVote(address voter) {
-        if (msg.sender != chairperson || voters[voter].voted) {
-            // \`throw\` terminates and reverts all changes to
-            // the state and to Ether balances. It is often
-            // a good idea to use this if functions are
-            // called incorrectly. But watch out, this
-            // will also consume all provided gas.
-            throw;
-        }
-        voters[voter].weight = 1;
+    // 正如其名, 这个是烧币(SB)的.. ,用于把创建者的 token 烧掉
+    function burn(uint256 _value) public returns (bool success) {
+        require(balanceOf[msg.sender] >= _value);   // 必须要有这么多
+        balanceOf[msg.sender] -= _value;
+        totalSupply -= _value;
+        Burn(msg.sender, _value);
+        return true;
     }
-
-    /// Delegate your vote to the voter \`to\`.
-    function delegate(address to) {
-        // assigns reference
-        Voter sender = voters[msg.sender];
-        if (sender.voted)
-            throw;
-
-        // Forward the delegation as long as
-        // \`to\` also delegated.
-        // In general, such loops are very dangerous,
-        // because if they run too long, they might
-        // need more gas than is available in a block.
-        // In this case, the delegation will not be executed,
-        // but in other situations, such loops might
-        // cause a contract to get "stuck" completely.
-        while (
-            voters[to].delegate != address(0) &&
-            voters[to].delegate != msg.sender
-        ) {
-            to = voters[to].delegate;
-        }
-
-        // We found a loop in the delegation, not allowed.
-        if (to == msg.sender) {
-            throw;
-        }
-
-        // Since \`sender\` is a reference, this
-        // modifies \`voters[msg.sender].voted\`
-        sender.voted = true;
-        sender.delegate = to;
-        Voter delegate = voters[to];
-        if (delegate.voted) {
-            // If the delegate already voted,
-            // directly add to the number of votes
-            proposals[delegate.vote].voteCount += sender.weight;
-        } else {
-            // If the delegate did not vote yet,
-            // add to her weight.
-            delegate.weight += sender.weight;
-        }
-    }
-
-    /// Give your vote (including votes delegated to you)
-    /// to proposal \`proposals[proposal].name\`.
-    function vote(uint proposal) {
-        Voter sender = voters[msg.sender];
-        if (sender.voted)
-            throw;
-        sender.voted = true;
-        sender.vote = proposal;
-
-        // If \`proposal\` is out of the range of the array,
-        // this will throw automatically and revert all
-        // changes.
-        proposals[proposal].voteCount += sender.weight;
-    }
-
-    /// @dev Computes the winning proposal taking all
-    /// previous votes into account.
-    function winningProposal() constant
-            returns (uint winningProposal)
-    {
-        uint winningVoteCount = 0;
-        for (uint p = 0; p < proposals.length; p++) {
-            if (proposals[p].voteCount > winningVoteCount) {
-                winningVoteCount = proposals[p].voteCount;
-                winningProposal = p;
-            }
-        }
-    }
-    
-    // Calls winningProposal() function to get the index
-    // of the winner contained in the proposals array and then
-    // returns the name of the winner
-    function winnerName() constant
-            returns (bytes32 winnerName)
-    {
-        winnerName = proposals[winningProposal()].name;
+    // 这个是用户销毁token.....
+    function burnFrom(address _from, uint256 _value) public returns (bool success) {
+        require(balanceOf[_from] >= _value);        // 一样要有这么多
+        require(_value <= allowance[_from][msg.sender]);    // 
+        balanceOf[_from] -= _value;
+        allowance[_from][msg.sender] -= _value;
+        totalSupply -= _value;
+        Burn(_from, _value);
+        return true;
     }
 }
